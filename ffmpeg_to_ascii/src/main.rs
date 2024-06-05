@@ -81,7 +81,7 @@ fn get_video_fps(video_file: &Path) -> io::Result<f64> {
         return Err(io::Error::new(io::ErrorKind::Other, "ffprobe command failed"));
     }
 
-    let frame_rate_str = String::from_utf8_lossy(dbg!(&output.stdout));
+    let frame_rate_str = String::from_utf8_lossy(&output.stdout);
     let mut frame_rate = frame_rate_str.trim().split("/");
     let numerator = frame_rate.next().ok_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to parse frame rate"))?.parse::<f64>()
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to parse frame rate"))?;
@@ -151,18 +151,42 @@ fn process_video_stream<T>(
 
     let mut bytes = vec![0u8; frame_bytes];
     let mut output_buffer = Buffer::ansi();
+    let mut read_buffer = vec![0u8; 2usize.pow(17)];
     while {
         // TODO: fix this so this doesn't read too fast that we catch up to
         // FFMpeg's output and make it fail fast
-        match stream.read(&mut bytes).unwrap() {
-            x if x == frame_bytes => true,
-            0 => false,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unexpected eof",
-                ))
-            },
+
+        // basically, we make our own implementation of buffered reader to
+        // anticipate whatever size is returned from a single read.
+
+        let mut buffer_index = 0;
+        loop {
+            match stream.read(&mut read_buffer[buffer_index ..])? {
+                // we've received data, and some overflows that we'll handle
+                x if frame_bytes <= x + buffer_index => {
+                    // move data from read buffer into the bytes to process
+                    bytes.iter_mut()
+                        .zip(read_buffer.iter())
+                        .for_each(|(a, b)| *a = *b);
+
+                    // shift data to the left all the way to the start
+                    for (from, to) in (0 ..).zip(buffer_index .. read_buffer.len()) {
+                        read_buffer.swap(from, to);
+                    }
+                    
+                    // then process the data
+                    break true;
+                },
+
+                // we've reached EOF
+                0 => break false,
+
+                // if we didn't get enough, advance the index and read again
+                x => {
+                    buffer_index += x;
+                    continue;
+                }
+            }
         }
     } {
         let image =
@@ -275,7 +299,6 @@ fn main() {
     );
 
     let framerate = get_video_fps(&args.video).unwrap();
-    dbg!(&framerate);
 
     let mut encoder = lz4::EncoderBuilder::new().level(9).build(std::io::stdout().lock()).unwrap();
 
